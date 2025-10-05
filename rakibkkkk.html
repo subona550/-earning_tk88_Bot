@@ -1,0 +1,462 @@
+# morich_bot.py
+"""
+Morich — Single-file Telegram Referral & Monetag Reward Bot
+- Single file runs both: Telegram bot (polling) + Flask reward server + serves earn page
+- DB: SQLite (bot_data.db in same folder)
+- IMPORTANT: For production, move BOT_TOKEN and MONETAG_CONTENT to environment variables or .env
+"""
+
+import os
+import sqlite3
+import uuid
+import logging
+from datetime import datetime, timedelta
+from threading import Thread
+
+from flask import Flask, request, jsonify, make_response
+from flask_cors import CORS
+
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+
+# ---------------- CONFIG ----------------
+# You provided a token; it's placed here for convenience.
+# Recommended: remove hardcoded token and use environment variable BOT_TOKEN instead.
+BOT_TOKEN = os.getenv('BOT_TOKEN') or '8378103195:AAFXxttTTclT2DoQzhmI6rtNBdzvd_v_Ob0'
+# Set ADMIN_ID to your telegram user id (for admin commands). Replace 0 with actual admin id.
+ADMIN_ID = int(os.getenv('ADMIN_ID') or '0')
+
+# Web / Monetag config
+# Put the Monetag content (the value inside content="...") into MONETAG_CONTENT env var for security,
+# or replace the placeholder below.
+MONETAG_CONTENT = os.getenv('MONETAG_CONTENT') or ''  # e.g. 4bcb097d714a587e4b7ff2c23538fb3e
+
+HOST = os.getenv('HOST', '0.0.0.0')
+PORT = int(os.getenv('PORT') or 8000)
+
+DB_PATH = os.getenv('DB_PATH') or 'bot_data.db'
+REWARD_AMOUNT = float(os.getenv('REWARD_AMOUNT') or 3)
+SESSION_TTL = int(os.getenv('SESSION_TTL') or 300)  # in seconds
+EARN_DEMO_AMOUNT = float(os.getenv('EARN_DEMO_AMOUNT') or 5)
+CURRENCY = os.getenv('CURRENCY') or '৳'
+# ----------------------------------------
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --------------- DB Helpers ----------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            referred_by INTEGER,
+            referrals INTEGER DEFAULT 0,
+            balance REAL DEFAULT 0,
+            created_at TEXT
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS earnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            reason TEXT,
+            created_at TEXT
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            payment_info TEXT,
+            status TEXT DEFAULT 'pending',
+            requested_at TEXT,
+            processed_at TEXT
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER,
+            used INTEGER DEFAULT 0,
+            created_at TEXT,
+            expires_at TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def db_execute(query, params=()):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(query, params)
+    conn.commit()
+    lastrowid = cur.lastrowid
+    conn.close()
+    return lastrowid
+
+def db_query(query, params=()):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def create_session_token(token, user_id, ttl_seconds=SESSION_TTL):
+    now = datetime.utcnow()
+    expires = now + timedelta(seconds=ttl_seconds)
+    db_execute('INSERT INTO sessions (token, user_id, used, created_at, expires_at) VALUES (?,?,?,?,?)',
+               (token, user_id, 0, now.isoformat(), expires.isoformat()))
+
+def use_session_token(token):
+    rows = db_query('SELECT user_id, used, expires_at FROM sessions WHERE token=?', (token,))
+    if not rows:
+        return None, 'not_found'
+    user_id, used, expires_at = rows[0]
+    expires_at = datetime.fromisoformat(expires_at)
+    if used:
+        return None, 'already_used'
+    if datetime.utcnow() > expires_at:
+        return None, 'expired'
+    db_execute('UPDATE sessions SET used=1 WHERE token=?', (token,))
+    return user_id, 'ok'
+
+# --------------- Flask Reward Server ----------------
+app = Flask(__name__)
+CORS(app)
+
+@app.route('/session')
+def get_session():
+    uid = request.args.get('uid')
+    if not uid:
+        return jsonify({'error': 'missing uid'}), 400
+    try:
+        uid_int = int(uid)
+    except:
+        return jsonify({'error': 'invalid uid'}), 400
+    token = str(uuid.uuid4())
+    create_session_token(token, uid_int, ttl_seconds=SESSION_TTL)
+    return jsonify({'token': token, 'ttl': SESSION_TTL})
+
+@app.route('/reward', methods=['POST'])
+def reward():
+    data = request.get_json(force=True)
+    token = data.get('token')
+    if not token:
+        return jsonify({'error': 'missing token'}), 400
+    user_id, status = use_session_token(token)
+    if status != 'ok':
+        return jsonify({'error': status}), 400
+    now = datetime.utcnow().isoformat()
+    db_execute('UPDATE users SET balance = balance + ? WHERE user_id=?', (REWARD_AMOUNT, user_id))
+    db_execute('INSERT INTO earnings (user_id, amount, reason, created_at) VALUES (?,?,?,?)', (user_id, REWARD_AMOUNT, 'watched ad', now))
+    return jsonify({'ok': True, 'user_id': user_id, 'amount': REWARD_AMOUNT})
+
+# Serve the earn page with embedded Monetag meta/script if MONETAG_CONTENT provided
+@app.route('/web/earn.html')
+def serve_earn():
+    uid = request.args.get('uid') or ''
+    monetag_meta = ''
+    monetag_script = ''
+    if MONETAG_CONTENT:
+        monetag_meta = f'<meta name="monetag" content="{MONETAG_CONTENT}">\n'
+        # Monetag script placeholder: Monetag often provides JS snippet — if they give a script URL you can paste here.
+        # For many setups the meta tag is enough plus loading monetag.js from their CDN. If you have the monetag script URL, set MONETAG_SCRIPT env var.
+        monetag_script_content = os.getenv('MONETAG_SCRIPT', '')
+        if monetag_script_content:
+            monetag_script = monetag_script_content
+        else:
+            # generic placeholder comment (no active script)
+            monetag_script = '<!-- Monetag script should be inserted here (MONETAG_SCRIPT) -->\n'
+
+    html = f"""<!doctype html>
+<html lang="bn">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Watch Ad & Earn — Morich</title>
+  {monetag_meta}
+  {monetag_script}
+  <style>
+    body {{ font-family: Arial, Helvetica, sans-serif; text-align:center; padding:30px; background:#f7f7f7; }}
+    .card {{ max-width:560px; margin: 30px auto; background:#fff; padding:20px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.08);} }
+    button {{ padding:12px 20px; font-size:16px; border-radius:6px; border:none; cursor:pointer; background:#007bff; color:#fff; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>🎬 অ্যাড দেখে ইনকাম করুন</h2>
+    <p id="status">পেজ লোড হচ্ছে…</p>
+    <button id="startBtn" disabled>Start Ad</button>
+    <p style="font-size:13px; color:#666; margin-top:12px">এই পেজটি খুলে 5 সেকেন্ড অপেক্ষা করুন, তারপর Start চাপুন।</p>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const uid = params.get('uid');
+    const startBtn = document.getElementById('startBtn');
+    const status = document.getElementById('status');
+    const API_BASE = window.location.origin; // reward server same origin
+
+    if (!uid) {{
+      status.textContent = 'UID মিসিং — সঠিক লিংক ব্যবহার করুন।';
+    }} else {{
+      status.textContent = 'সেশন তৈরির জন্য সার্ভারে অনুরোধ করা হচ্ছে...';
+      fetch(`${{API_BASE}}/session?uid=${{uid}}`).then(r=>r.json()).then(data=>{
+        if (data.token) {{
+          status.textContent = 'সেশন তৈরি হয়েছে। Start টিতে ক্লিক করে অ্যাড দেখুন।';
+          startBtn.disabled = false;
+          window.__MORICH_SESSION_TOKEN = data.token;
+        }} else {{
+          status.textContent = 'সেশন তৈরি করা যায়নি।';
+        }}
+      }).catch(err=>{
+        console.error(err); status.textContent = 'সেশন সার্ভারে ত্রুটি — ওয়েবসার্ভার চালু আছে কি দেখুন।';
+      });
+    }}
+
+    function startAd() {{
+      if (!window.__MORICH_SESSION_TOKEN) {{ alert('Session token নেই'); return; }}
+
+      // ===== MONETAG integration point =====
+      // Replace the block below with Monetag's recommended rewarded-ad call.
+      // Example (pseudo):
+      // Monetag.showRewarded().then(()=>{{ claimReward(token) }}).catch(()=>{{ alert('Ad failed') }});
+      //
+      // If you do not have a direct Monetag JS call, but Monetag triggers a callback after completion,
+      // invoke claimReward(token) from that callback.
+      //
+      // For now (fallback) we immediately claim reward for demo/testing:
+      claimReward(window.__MORICH_SESSION_TOKEN);
+    }}
+
+    function claimReward(token) {{
+      status.textContent = 'রিওয়ার্ড ক্লেইম করা হচ্ছে...';
+      fetch(`${{API_BASE}}/reward`, {{
+        method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ token }})
+      }}).then(r=>r.json()).then(res=>{
+        if (res.ok) {{
+          status.textContent = `পুরস্কার পাওয়া গেছে: ${{res.amount}}`;
+          startBtn.disabled = true;
+        }} else {{
+          status.textContent = 'রিওয়ার্ড ক্লেইম করা যায়নি: ' + (res.error||JSON.stringify(res));
+        }}
+      }}).catch(e=>{{ console.error(e); status.textContent = 'রিওয়ার্ড সার্ভারে ত্রুটি'; }});
+    }}
+
+    startBtn.addEventListener('click', startAd);
+  </script>
+</body>
+</html>
+"""
+    resp = make_response(html)
+    resp.headers['Content-Type'] = 'text/html; charset=utf-8'
+    return resp
+
+# --------------- Telegram Bot ----------------
+def admin_only(func):
+    def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
+        user_id = update.effective_user.id
+        if user_id != ADMIN_ID:
+            update.message.reply_text('এই কমান্ডটি শুধুমাত্র অ্যাডমিন ব্যবহার করতে পারবেন।')
+            return
+        return func(update, context, *args, **kwargs)
+    return wrapped
+
+def start_cmd(update: Update, context: CallbackContext):
+    user = update.effective_user
+    args = context.args
+    referrer = None
+    if args:
+        try:
+            referrer = int(args[0])
+        except:
+            referrer = None
+
+    created_at = datetime.utcnow().isoformat()
+    rows = db_query('SELECT * FROM users WHERE user_id=?', (user.id,))
+    if not rows:
+        db_execute('INSERT INTO users (user_id, username, full_name, referred_by, created_at) VALUES (?,?,?,?,?)',
+                   (user.id, user.username or '', user.full_name or '', referrer, created_at))
+        if referrer and referrer != user.id:
+            db_execute('UPDATE users SET referrals = referrals + 1 WHERE user_id=?', (referrer,))
+            bonus = float(os.getenv('REFERRAL_BONUS') or 10)
+            db_execute('UPDATE users SET balance = balance + ? WHERE user_id=?', (bonus, referrer))
+            db_execute('INSERT INTO earnings (user_id, amount, reason, created_at) VALUES (?,?,?,?)', (referrer, bonus, 'referral bonus', created_at))
+            try:
+                context.bot.send_message(chat_id=referrer, text=f'আপনার রেফার করে নতুন ব্যবহারকারী যোগ হয়েছে — বোনাস {bonus} {CURRENCY} যোগ হয়েছে।')
+            except Exception as e:
+                logger.warning("can't message referrer: %s", e)
+        update.message.reply_text('স্বাগতম! আপনার একাউন্ট তৈরি করা হয়েছে। /help দেখে নিন।')
+    else:
+        update.message.reply_text('আপনি আগেই রেজিস্টার করা আছেন। /help টিপুন।')
+
+    bot_username = context.bot.username
+    ref_link = f'https://t.me/{bot_username}?start={user.id}'
+    update.message.reply_text(f'আপনার রেফারাল লিংক: {ref_link}\nShare করে আয় বাড়ান!')
+
+def help_cmd(update: Update, context: CallbackContext):
+    txt = (
+        '/referral - আপনার রেফারাল লিংক ও স্ট্যাটস\n'
+        '/balance - আপনার ব্যালেন্স দেখুন\n'
+        '/earn - ওয়েব পেজে অ্যাড দেখে ইনকাম করুন\n'
+        '/earn_demo - ডেমো আর্ন (বট থেকে সরাসরি)\n'
+        '/withdraw <amount> <payment_info> - উইথড্র রিকোয়েস্ট\n'
+        '/help - এই মেসেজটি দেখুন\n\n'
+        'অ্যাডমিন: /withdrawals , /approve <withdrawal_id>'
+    )
+    update.message.reply_text(txt)
+
+def referral_cmd(update: Update, context: CallbackContext):
+    user = update.effective_user
+    rows = db_query('SELECT referrals, balance FROM users WHERE user_id=?', (user.id,))
+    if not rows:
+        update.message.reply_text('প্রথমে /start করুন।')
+        return
+    referrals, balance = rows[0]
+    bot_username = context.bot.username
+    ref_link = f'https://t.me/{bot_username}?start={user.id}'
+    update.message.reply_text(f'রেফারাল লিংক:\n{ref_link}\nরেফারাল সংখ্যা: {referrals}\nব্যালেন্স: {balance} {CURRENCY}')
+
+def balance_cmd(update: Update, context: CallbackContext):
+    user = update.effective_user
+    rows = db_query('SELECT balance FROM users WHERE user_id=?', (user.id,))
+    if not rows:
+        update.message.reply_text('প্রথমে /start করুন।')
+        return
+    balance = rows[0][0]
+    update.message.reply_text(f'আপনার ব্যালেন্স: {balance} {CURRENCY}')
+
+def earn_cmd(update: Update, context: CallbackContext):
+    user = update.effective_user
+    rows = db_query('SELECT balance FROM users WHERE user_id=?', (user.id,))
+    if not rows:
+        update.message.reply_text('প্রথমে /start করুন।')
+        return
+    # Build earn page link
+    # If you expose Flask server publicly on domain (HOST_DOMAIN), replace origin accordingly.
+    # For simplicity, we will use a relative link if bot and server on same machine and using ngrok / domain mapping.
+    host_for_links = os.getenv('HOST_DOMAIN') or f'http://{os.getenv("PUBLIC_HOST", "localhost")}:{PORT}'
+    earn_link = f"{host_for_links}/web/earn.html?uid={user.id}"
+    update.message.reply_text(f"🎥 অ্যাড দেখতে নিচের লিংকে যান এবং ইনকাম করুন:\n{earn_link}\n\n(পেজ ওপেন করলে Start চাপুন।)")
+
+def earn_demo_cmd(update: Update, context: CallbackContext):
+    user = update.effective_user
+    rows = db_query('SELECT balance FROM users WHERE user_id=?', (user.id,))
+    if not rows:
+        update.message.reply_text('প্রথমে /start করুন।')
+        return
+    now = datetime.utcnow().isoformat()
+    db_execute('UPDATE users SET balance = balance + ? WHERE user_id=?', (EARN_DEMO_AMOUNT, user.id))
+    db_execute('INSERT INTO earnings (user_id, amount, reason, created_at) VALUES (?,?,?,?)', (user.id, EARN_DEMO_AMOUNT, 'demo earn', now))
+    update.message.reply_text(f'আপনি পেয়েছেন {EARN_DEMO_AMOUNT} {CURRENCY} (ডেমো)। /balance দেখুন।')
+
+def withdraw_cmd(update: Update, context: CallbackContext):
+    user = update.effective_user
+    rows = db_query('SELECT balance FROM users WHERE user_id=?', (user.id,))
+    if not rows:
+        update.message.reply_text('প্রথমে /start করুন।')
+        return
+    if len(context.args) < 2:
+        update.message.reply_text('ব্যবহার: /withdraw <amount> <payment_info>\nউদাহরণ: /withdraw 50 bkash:017xxxx')
+        return
+    try:
+        amount = float(context.args[0])
+    except:
+        update.message.reply_text('দয়া করে সঠিক সংখ্যা লিখুন।')
+        return
+    payment_info = ' '.join(context.args[1:])
+    balance_val = rows[0][0]
+    if amount <= 0 or amount > balance_val:
+        update.message.reply_text('আপনার ব্যালেন্স অপ্রতুল।')
+        return
+    now = datetime.utcnow().isoformat()
+    wid = db_execute('INSERT INTO withdrawals (user_id, amount, payment_info, requested_at) VALUES (?,?,?,?)', (user.id, amount, payment_info, now))
+    db_execute('UPDATE users SET balance = balance - ? WHERE user_id=?', (amount, user.id))
+    update.message.reply_text(f'আপনার উইথড্র রিকোয়েস্ট গ্রহণ করা হয়েছে। রিকোয়েস্ট আইডি: {wid}. অ্যাডমিন অনুমোদন করলে পেমেন্ট হবে।')
+    try:
+        if ADMIN_ID:
+            context.bot.send_message(ADMIN_ID, text=f'New withdrawal request #{wid}\nUser: {user.id}\nAmount: {amount} {CURRENCY}\nInfo: {payment_info}')
+    except Exception as e:
+        logger.warning('cannot notify admin: %s', e)
+
+@admin_only
+def withdrawals_cmd(update: Update, context: CallbackContext):
+    rows = db_query("SELECT id, user_id, amount, payment_info, status, requested_at FROM withdrawals WHERE status='pending' ORDER BY requested_at DESC")
+    if not rows:
+        update.message.reply_text('কোনো pending উইথড্র নেই।')
+        return
+    txt = 'Pending withdrawals:\n'
+    for r in rows:
+        txt += f'ID: {r[0]} | User: {r[1]} | {r[2]} {CURRENCY} | {r[3]} | {r[5]}\n'
+    update.message.reply_text(txt)
+
+@admin_only
+def approve_cmd(update: Update, context: CallbackContext):
+    if len(context.args) < 1:
+        update.message.reply_text('ব্যবহার: /approve <withdrawal_id>')
+        return
+    try:
+        wid = int(context.args[0])
+    except:
+        update.message.reply_text('সঠিক ID দিন।')
+        return
+    rows = db_query('SELECT user_id, amount, status FROM withdrawals WHERE id=?', (wid,))
+    if not rows:
+        update.message.reply_text('আইডি পাওয়া যায়নি।')
+        return
+    user_id, amount, status = rows[0]
+    if status != 'pending':
+        update.message.reply_text('এই রিকোয়েস্টটি ইতোমধ্যে প্রসেস করা হয়েছে।')
+        return
+    now = datetime.utcnow().isoformat()
+    db_execute('UPDATE withdrawals SET status=?, processed_at=? WHERE id=?', ('approved', now, wid))
+    update.message.reply_text(f'Withdrawal #{wid} অনুমোদিত।')
+    try:
+        context.bot.send_message(user_id, text=f'আপনার উইথড্র রিকোয়েস্ট #{wid} অনুমোদিত। (Manual payment অপেক্ষা করুন)।')
+    except Exception as e:
+        logger.warning('cannot message user after approve: %s', e)
+
+def unknown_cmd(update: Update, context: CallbackContext):
+    update.message.reply_text('দুঃখিত, আমি বুঝিনি। /help দেখুন।')
+
+def run_telegram_bot():
+    if not BOT_TOKEN or BOT_TOKEN.startswith('REPLACE'):
+        print('Please set your BOT_TOKEN (environment variable) before running.')
+        return
+    init_db()
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler('start', start_cmd, pass_args=True))
+    dp.add_handler(CommandHandler('help', help_cmd))
+    dp.add_handler(CommandHandler('referral', referral_cmd))
+    dp.add_handler(CommandHandler('balance', balance_cmd))
+    dp.add_handler(CommandHandler('earn', earn_cmd))
+    dp.add_handler(CommandHandler('earn_demo', earn_demo_cmd))
+    dp.add_handler(CommandHandler('withdraw', withdraw_cmd, pass_args=True))
+    dp.add_handler(CommandHandler('withdrawals', withdrawals_cmd))
+    dp.add_handler(CommandHandler('approve', approve_cmd, pass_args=True))
+    dp.add_handler(MessageHandler(Filters.command, unknown_cmd))
+
+    print('Telegram bot started... Press Ctrl+C to stop')
+    updater.start_polling()
+    updater.idle()
+
+# --------------- Start both services ----------------
+if __name__ == '__main__':
+    print('Starting Morich (Flask reward server + Telegram bot)...')
+    init_db()
+    # Start Flask in a thread
+    t = Thread(target=lambda: app.run(host=HOST, port=PORT, debug=False, use_reloader=False))
+    t.daemon = True
+    t.start()
+    # Run telegram bot (blocking)
+    run_telegram_bot()
