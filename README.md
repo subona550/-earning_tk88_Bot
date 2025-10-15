@@ -1,3 +1,4 @@
+https://subona550.github.io/-earning_tk88_Bot/
 # Creating GitHub-ready ZIP for earning_tk88_bot with Monetag ad integration.
 import os, zipfile, textwrap, json, pathlib
 base = "/mnt/data/earning_tk88_bot_package"
